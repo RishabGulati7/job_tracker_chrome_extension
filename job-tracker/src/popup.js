@@ -4,7 +4,7 @@ import { getConfig, setConfig } from './storage.js';
 import { initOnboarding } from './onboarding.js';
 import { renderSettings } from './settings.js';
 import { readHeaders, readAllRows, appendRow } from './sheets.js';
-import { extractJobData, mapColumnsToFields, buildRowValues } from './claude.js';
+import { extractJobData, mapColumnsToFields, buildRowValues, analyzeResumeMatch } from './claude.js';
 
 document.addEventListener('DOMContentLoaded', async () => {
   const root = document.getElementById('app');
@@ -23,10 +23,14 @@ async function renderIdle(root) {
   root.innerHTML = `<div class="state-idle">
     <div class="idle-logo"><span class="logo-mark">◆</span><span class="logo-text">Job Tracker</span></div>
     <p class="idle-tagline">Tracked by Claude. Saved to Sheets.</p>
-    <button class="btn-track" id="btn-track">Track This Application</button>
+    <div class="idle-actions">
+      <button class="btn-track" id="btn-track">Track This Application</button>
+      <button class="btn-resume-fit" id="btn-resume-fit">Resume Compatibility</button>
+    </div>
     ${footer(config)}
   </div>`;
   root.querySelector('#btn-track').addEventListener('click', () => startExtraction(root));
+  root.querySelector('#btn-resume-fit').addEventListener('click', () => renderResumeMatch(root));
   wireFooter(root);
 }
 
@@ -142,6 +146,141 @@ function renderError(root, message) {
     <button class="btn-primary" id="btn-retry">Retry</button>
   </div>`;
   root.querySelector('#btn-retry').addEventListener('click', () => renderIdle(root));
+}
+
+async function renderResumeMatch(root) {
+  root.innerHTML = `<div class="state-resume-match">
+    <div class="match-top">
+      <button class="btn-back" id="btn-back">← Back</button>
+      <span class="match-title">Resume Compatibility</span>
+      <p class="match-desc">Score your resume against this job posting.</p>
+    </div>
+    <div class="match-body">
+      <label class="file-drop" id="file-drop-zone" for="resume-file">
+        <input type="file" id="resume-file" accept=".pdf" style="display:none"/>
+        <span class="file-drop-icon">📄</span>
+        <span class="file-drop-text">Click to upload resume</span>
+        <span class="file-drop-hint">PDF format · max 10 MB</span>
+      </label>
+      <div class="file-selected" id="file-selected" style="display:none">
+        <span class="file-selected-icon">✓</span>
+        <span class="file-name" id="file-name"></span>
+        <button class="btn-clear-file" id="btn-clear-file" type="button">✕</button>
+      </div>
+      <button class="btn-primary" id="btn-analyze" disabled>Analyze</button>
+    </div>
+  </div>`;
+
+  let cachedBase64 = null;
+  const fileInput = root.querySelector('#resume-file');
+  const fileDropEl = root.querySelector('#file-drop-zone');
+  const fileSelected = root.querySelector('#file-selected');
+  const fileNameEl = root.querySelector('#file-name');
+  const btnAnalyze = root.querySelector('#btn-analyze');
+
+  const showCached = (fileName, base64) => {
+    cachedBase64 = base64;
+    fileNameEl.textContent = fileName;
+    fileDropEl.style.display = 'none';
+    fileSelected.style.display = 'flex';
+    btnAnalyze.disabled = false;
+  };
+
+  const clearCache = () => {
+    cachedBase64 = null;
+    fileInput.value = '';
+    fileSelected.style.display = 'none';
+    fileDropEl.style.display = 'flex';
+    btnAnalyze.disabled = true;
+    chrome.storage.session.remove('resumeCache');
+  };
+
+  // Restore cached resume if available
+  const { resumeCache } = await chrome.storage.session.get('resumeCache');
+  if (resumeCache) showCached(resumeCache.fileName, resumeCache.pdfBase64);
+
+  fileInput.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const base64 = await readFileAsBase64(file);
+    await chrome.storage.session.set({ resumeCache: { pdfBase64: base64, fileName: file.name } });
+    showCached(file.name, base64);
+  });
+
+  root.querySelector('#btn-clear-file').addEventListener('click', clearCache);
+  btnAnalyze.addEventListener('click', () => { if (cachedBase64) startResumeMatch(root, cachedBase64); });
+  root.querySelector('#btn-back').addEventListener('click', () => renderIdle(root));
+}
+
+async function startResumeMatch(root, pdfBase64) {
+  root.innerHTML = `<div class="state-loading"><div class="loading-spinner"></div><p class="loading-status" id="ls">Reading page…</p></div>`;
+  const setStatus = (m) => { const el = root.querySelector('#ls'); if (el) el.textContent = m; };
+
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) throw new Error('Could not access the current tab.');
+    let pageText = '';
+    try {
+      const results = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => document.body.innerText });
+      pageText = results?.[0]?.result || '';
+    } catch (_) { throw new Error('Cannot read this page. Open a job posting and try again.'); }
+    if (!pageText.trim()) throw new Error('Page appears empty. Open a job posting first.');
+    setStatus('Analyzing compatibility…');
+    const result = await analyzeResumeMatch(pageText, pdfBase64);
+    renderMatchResult(root, result);
+  } catch (err) {
+    root.innerHTML = `<div class="state-error">
+      <div class="error-icon">✕</div>
+      <p class="error-message">${esc(err.message || 'Something went wrong.')}</p>
+      <button class="btn-primary" id="btn-retry">Try Again</button>
+    </div>`;
+    root.querySelector('#btn-retry').addEventListener('click', () => renderResumeMatch(root));
+  }
+}
+
+function renderMatchResult(root, result) {
+  const score = Math.max(0, Math.min(100, Math.round(result.score || 0)));
+  const ringClass = score >= 75 ? 'score-ring-green' : score >= 50 ? 'score-ring-yellow' : 'score-ring-red';
+  const fitLabel = score >= 75 ? 'Strong fit' : score >= 50 ? 'Moderate fit' : 'Weak fit';
+  const strengths = Array.isArray(result.strengths) ? result.strengths.slice(0, 3) : [];
+  const gaps = Array.isArray(result.gaps) ? result.gaps.slice(0, 3) : [];
+  const listItems = (items) => items.map((s) => `<li>${esc(String(s))}</li>`).join('');
+
+  root.innerHTML = `<div class="state-match-result">
+    <div class="match-result-header">
+      <button class="btn-back" id="btn-back">← Back</button>
+    </div>
+    <div class="match-result-body">
+      <div class="score-ring ${ringClass}">
+        <span class="score-num">${score}<span class="score-pct">%</span></span>
+        <span class="score-label">${fitLabel}</span>
+      </div>
+      <p class="match-summary">${esc(result.summary || '')}</p>
+      ${strengths.length ? `<div class="match-section">
+        <div class="match-section-label">Strengths</div>
+        <ul class="match-list match-list-green">${listItems(strengths)}</ul>
+      </div>` : ''}
+      ${gaps.length ? `<div class="match-section">
+        <div class="match-section-label">Gaps</div>
+        <ul class="match-list match-list-red">${listItems(gaps)}</ul>
+      </div>` : ''}
+    </div>
+    <div class="match-result-footer">
+      <button class="btn-primary" id="btn-new-resume">Try Another Resume</button>
+    </div>
+  </div>`;
+
+  root.querySelector('#btn-back').addEventListener('click', () => renderIdle(root));
+  root.querySelector('#btn-new-resume').addEventListener('click', () => renderResumeMatch(root));
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = () => reject(new Error('Failed to read file.'));
+    reader.readAsDataURL(file);
+  });
 }
 
 function findDuplicate(rows, mapping, jobData) {

@@ -42,7 +42,7 @@ Fields:
 
 Rules:
 - Never hallucinate or infer values not present in the text.
-- For basePay, copy the exact figure/range from the page.
+- For basePay, extract the salary figure/range and format it with a "$" prefix before each number (e.g. "$100,000 - $120,000"). Do NOT include currency labels like "USD", "CAD", etc. Do NOT append pay period qualifiers like "annually", "per year", "yearly", etc.
 - For notes, only include a team name if the posting explicitly names it.
 - requestedBasePay and addedBy are never extracted — omit from JSON entirely.`;
 
@@ -99,6 +99,59 @@ const FIELD_ALIASES = {
   notes:            ['notes','note','team','comments','additional info','info'],
   addedBy:          ['added by','tracked by','added','by'],
 };
+
+export async function analyzeResumeMatch(jobText, pdfBase64) {
+  const MATCH_SYSTEM = `You are a resume-to-job-description matcher. Analyze how well a candidate's resume matches a given job description and return ONLY a valid JSON object — no markdown, no explanation.
+
+Fields:
+- score: integer (0-100, overall match percentage)
+- summary: string (1-2 sentences, honest overall fit assessment)
+- strengths: array of exactly 3 strings (specific matching areas between resume and job)
+- gaps: array of exactly 3 strings (key job requirements not well-addressed in the resume)
+
+Rules:
+- Be accurate — do not inflate scores
+- Strengths and gaps must be specific, not generic
+- Score 80-100: strong match, 60-79: decent fit, below 60: significant gaps`;
+
+  const response = await fetch(CLAUDE_API_URL, {
+    method: 'POST',
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 1024,
+      system: MATCH_SYSTEM,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 } },
+          { type: 'text', text: `Job Description:\n\n${jobText.slice(0, 8000)}` },
+        ],
+      }],
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Claude API error ${response.status}`);
+  }
+
+  const data = await response.json();
+  const rawText = data.content?.[0]?.text || '{}';
+  let result;
+  try {
+    const cleaned = rawText.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    result = JSON.parse(cleaned);
+  } catch (_) { throw new Error('Could not parse match analysis. Please try again.'); }
+
+  if (typeof result.score !== 'number') throw new Error('Unexpected response from Claude. Please try again.');
+  return result;
+}
 
 export function mapColumnsToFields(headers) {
   const mapping = {};
